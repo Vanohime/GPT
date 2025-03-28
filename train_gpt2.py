@@ -253,14 +253,20 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     devise = "mps"
 print(f"using device {device}")
 
+
+
+total_batch_size = 2**12 #2**12 tokens
+B = 4 #micro batch size
+T = 256 #context length
+assert total_batch_size % (B*T) == 0, "total batch size must be divisible by B*T"
+grad_accum_steps = total_batch_size // (B*T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
 train_loader = DataLoaderLite(4, 256)
-
-
 #get logits
-#model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-#logits, loss = model(x, y)
 
 max_lr = 3e-4
 min_lr = max_lr * 0.1
@@ -281,16 +287,19 @@ def get_lr(it):
 #optimize
 import time
 
-#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizer(learning_rate=max_lr, weight_decay=0.1, device=device)
 
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     #change the learning rate
     lr = get_lr(step)
@@ -302,8 +311,8 @@ for step in range(max_steps):
         #torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 #time in ms
-    tok_per_ms = (train_loader.B * train_loader.T) / dt
-    print(f"step {step} | loss: {loss.item():.6f} | lr: {lr:.8f} |  norm: {norm:.4f} | time: {dt:.4f} | tokens per millisecond {tok_per_ms:.4f}")
+    tok_per_ms = (train_loader.B * train_loader.T * grad_accum_steps) / dt
+    print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.8f} |  norm: {norm:.4f} | time: {dt:.4f} | tokens per millisecond {tok_per_ms:.4f}")
 
 
 import sys; sys.exit(0)
