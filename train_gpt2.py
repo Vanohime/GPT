@@ -1,3 +1,4 @@
+import inspect
 import math
 from dataclasses import dataclass
 import torch
@@ -26,6 +27,7 @@ class CasualSelfAttention(nn.Module):
 
         self.register_buffer("bias",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
 
     def forward(self, x):
@@ -36,11 +38,14 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
         #attention (matrix mask (T, T))
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1) #makes rows sum to 1
-        y = att @ v
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1) #makes rows sum to 1
+        #y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         #output projection
         y = self.c_proj(y)
@@ -55,6 +60,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -102,7 +108,10 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std = (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -130,7 +139,30 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
         
-            
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        #create optim groups
+        #we dont want to decay 1-dimensional tensors like biases etc
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num  decayed parameter tensors {len(decay_params)}, with {num_decay_params} params")
+        print(f"num non decayed parameter tensors {len(nodecay_params)}, with {num_nodecay_params} params")
+        #create AdamW optimizer and use fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+
 
 
     @classmethod
@@ -221,25 +253,58 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     devise = "mps"
 print(f"using device {device}")
 
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(4, 256)
 
 
 #get logits
 #model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 #logits, loss = model(x, y)
 
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 30
+
+def get_lr(it):
+    if it < warmup_steps :
+        return max_lr * (it+1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+import time
+
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizer(learning_rate=max_lr, weight_decay=0.1, device=device)
+
+for step in range(max_steps):
+    t0 = time.time()
     optimizer.zero_grad()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-    logits, loss = model(x,y)
+    logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    #change the learning rate
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    #if device == "cuda":
+        #torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 #time in ms
+    tok_per_ms = (train_loader.B * train_loader.T) / dt
+    print(f"step {step} | loss: {loss.item():.6f} | lr: {lr:.8f} |  norm: {norm:.4f} | time: {dt:.4f} | tokens per millisecond {tok_per_ms:.4f}")
+
 
 import sys; sys.exit(0)
 
@@ -277,7 +342,7 @@ while x.size(1) < max_length:
         x = torch.cat((x, xcol), dim=1)
 
 #print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
+for step in range(num_return_sequences):
+    tokens = x[step, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
