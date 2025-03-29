@@ -216,19 +216,34 @@ class GPT(nn.Module):
 
 
 #----------------------------------------------------------------------------------
-import tiktoken
+import numpy as np
+import os
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, split):
         self.B = B
         self.T = T
+        assert split in ['train', 'val']
 
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        print(f"found {len(shards)} shards for split {split}")
+
+        #init current_shard as zro
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = 0
 
         self.current_position = 0
     def next_batch(self):
@@ -241,6 +256,8 @@ class DataLoaderLite:
         self.current_position += B * T
         #if we are out of bounds reset to zero
         if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = 0
         return x, y
 #----------------------------------------------------------------------------------
@@ -263,10 +280,11 @@ grad_accum_steps = total_batch_size // (B*T)
 print(f"total desired batch size: {total_batch_size}")
 print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(4, 256)
-#get logits
+train_loader = DataLoaderLite(4, 256, split='train')
+#create model
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+#model = torch.compile(model)
 
 max_lr = 3e-4
 min_lr = max_lr * 0.1
